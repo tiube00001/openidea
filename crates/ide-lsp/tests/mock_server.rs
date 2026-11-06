@@ -2810,6 +2810,72 @@ async fn references_open_unopened_files_that_mention_the_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn gopls_searches_do_not_scan_or_open_same_named_candidates() {
+    let r =
+        |sl, sc, el, ec| json!({ "start": { "line": sl, "character": sc }, "end": { "line": el, "character": ec } });
+    for found in [true, false] {
+        let h = harness_for("go", "go", &[("gopls", incremental_caps())], &[]);
+        let s = h.launcher.state("gopls");
+        std::fs::create_dir_all(h.root.join("internal/gateway")).unwrap();
+        std::fs::create_dir_all(h.root.join("cmd/gateway")).unwrap();
+        let source = format!("{}func New(version string) {{}}\n", "\n".repeat(21));
+        let (doc, path) = h.open("internal/gateway/gateway.go", &source);
+        let caller = h.root.join("cmd/gateway/main.go");
+        std::fs::write(&caller, "package main\nfunc main() { gateway.New(version) }\n").unwrap();
+        let unrelated = h.root.join("unrelated.go");
+        std::fs::write(&unrelated, "package unrelated\nfunc New() {}\n").unwrap();
+        let scans = Arc::new(AtomicUsize::new(0));
+        let seen = scans.clone();
+        h.mgr.set_candidates_hook(Box::new(move |q, _| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(q.word, "New");
+            ide_lsp::CandidateFiles { files: vec![unrelated.clone()], limit_hit: true }
+        }));
+        let location = json!({ "uri": uri_of(&caller), "range": r(1, 22, 1, 25) });
+        s.respond("textDocument/references", if found { json!([location]) } else { json!([]) });
+        let mut changes = serde_json::Map::new();
+        if found {
+            changes.insert(uri_of(&caller), json!([{ "range": r(1, 22, 1, 25), "newText": "Renamed" }]));
+        }
+        s.respond("textDocument/rename", json!({ "changes": changes }));
+        let item = json!({ "name": "New", "kind": 12, "uri": uri_of(&path),
+            "range": r(21, 0, 21, 35), "selectionRange": r(21, 5, 21, 8) });
+        s.respond("textDocument/prepareCallHierarchy", json!([item]));
+        let from = json!({ "name": "main", "kind": 12, "uri": uri_of(&caller),
+            "range": r(1, 0, 1, 36), "selectionRange": r(1, 5, 1, 9) });
+        s.respond(
+            "callHierarchy/incomingCalls",
+            if found { json!([{ "from": from, "fromRanges": [r(1, 22, 1, 25)] }]) } else { json!([]) },
+        );
+        h.wait_status("gopls", ServerStatus::Ready).await;
+        eventually(|| s.docs.lock().len() == 1).await;
+
+        let at = Pos::new(21, 5);
+        let refs = h.mgr.references(doc, at, false, true, Default::default()).await.unwrap();
+        assert_eq!(refs.locations.len(), usize::from(found));
+        assert_eq!(refs.incomplete, None);
+        if found {
+            assert_eq!(refs.locations[0].path.as_ref(), caller);
+        }
+        let renamed = h.mgr.rename(doc, at, "Renamed".into(), Default::default()).await.unwrap();
+        assert_eq!(renamed.edit.files.len(), usize::from(found));
+        assert_eq!(renamed.incomplete, None);
+        let calls = h.mgr.call_hierarchy(doc, at, HierarchyDirection::Incoming, Default::default()).await.unwrap();
+        assert_eq!(calls.items.len(), usize::from(found));
+        assert_eq!(calls.incomplete, None);
+        if found {
+            assert_eq!(calls.items[0].path.as_ref(), caller);
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
+        for method in ["textDocument/references", "textDocument/rename", "callHierarchy/incomingCalls"] {
+            assert_eq!(s.requested(method).len(), 1, "{method}");
+        }
+        assert_eq!(uris(&s.notified("textDocument/didOpen")), [uri_of(&path)]);
+        assert!(s.notified("textDocument/didClose").is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn references_never_reopen_or_close_the_users_files() {
     let h = harness(&[("mock", incremental_caps())]);
     let s = h.launcher.state("mock");
@@ -3236,13 +3302,22 @@ async fn opening_a_file_during_a_search_takes_it_over() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_empty_answer_while_indexing_is_retried_when_indexing_ends() {
-    let h = harness(&[("mock", incremental_caps())]);
-    let s = h.launcher.state("mock");
+    indexing_retries("mock").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gopls_still_retries_an_empty_answer_after_indexing() {
+    indexing_retries("gopls").await;
+}
+
+async fn indexing_retries(name: &str) {
+    let h = harness(&[(name, incremental_caps())]);
+    let s = h.launcher.state(name);
     let (doc, path) = h.open("a.mk", "def target\n");
-    h.wait_status("mock", ServerStatus::Ready).await;
+    h.wait_status(name, ServerStatus::Ready).await;
     let peer = s.peer();
     peer.notify("$/progress", json!({ "token": "idx", "value": { "kind": "begin", "title": "Indexing" } })).unwrap();
-    h.wait_status("mock", ServerStatus::Busy).await;
+    h.wait_status(name, ServerStatus::Busy).await;
     // Nothing found while indexing; indexing ends once that answer is out.
     s.respond("textDocument/references", Value::Array(occurrences(&uri_of(&path), "def target\n")));
     let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3263,7 +3338,7 @@ async fn an_empty_answer_while_indexing_is_retried_when_indexing_ends() {
     s.peer()
         .notify("$/progress", json!({ "token": "again", "value": { "kind": "begin", "title": "Indexing" } }))
         .unwrap();
-    h.wait_status("mock", ServerStatus::Busy).await;
+    h.wait_status(name, ServerStatus::Busy).await;
     let refs = h.mgr.references(doc, Pos::new(0, 5), true, true, Default::default()).await.unwrap();
     assert_eq!((refs.locations.len(), refs.incomplete), (1, None));
     s.respond("textDocument/references", json!([]));

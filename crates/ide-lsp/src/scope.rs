@@ -110,7 +110,9 @@ impl LspManager {
         Fut: Future<Output = IdeResult<R>>,
     {
         let busy = t.server.is_busy();
-        let word = search_word(snap, pos).filter(|_| t.caps().open_close);
+        // gopls already searches its workspace. Opening same-name candidates forces
+        // it to reanalyse unrelated packages before it can answer again.
+        let word = search_word(snap, pos).filter(|_| t.caps().open_close && t.server.name != "gopls");
         let candidates = async {
             match word {
                 Some(w) => self.candidates(t, w, cancel).await,
