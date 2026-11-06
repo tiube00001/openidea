@@ -6,8 +6,8 @@
 //! `<app-data>/tools/<name>/` (npm packages to `<app-data>/tools/node_modules`),
 //! except toolchain-managed components (`rustup component`, `pip --user`).
 //!
-//! Language servers find managed tools once [`extend_process_path`] has put
-//! [`tools_bin_dirs`] on the process `PATH` at startup.
+//! [`extend_process_path`] adds installed tools at startup; the host refreshes
+//! child processes' `PATH` after installs and removals.
 //!
 //! GitHub API downloads prefer `GITHUB_TOKEN`, then `GH_TOKEN`, then the active
 //! `github.com` account from `gh auth token --hostname github.com`. The CLI is
@@ -127,10 +127,9 @@ pub fn python_lib_dir(tools_root: &Path, name: &str) -> PathBuf {
     tools_root.join(name).join("lib")
 }
 
-/// Every directory a managed tool's executables can live in (existing or not,
-/// so a `PATH` computed at startup also covers tools installed later).
+/// Existing directories containing managed tools' executables, in search order.
 pub fn tools_bin_dirs(app_data: &Path) -> Vec<PathBuf> {
-    bin_dirs_in(&tools_dir(app_data), Platform::current())
+    bin_dirs_in(&tools_dir(app_data), Platform::current()).into_iter().filter(|d| d.is_dir()).collect()
 }
 
 fn bin_dirs_in(root: &Path, platform: Platform) -> Vec<PathBuf> {
@@ -176,17 +175,19 @@ pub fn extend_process_path(app_data: &Path) {
     }
 }
 
-/// `path` (a `PATH` value) with [`tools_bin_dirs`] in front, those it lacks, and the
-/// mise / asdf shims when their shell hook didn't put them there.
+/// Refreshes managed entries in `path`, keeping only existing directories, and
+/// adds mise / asdf shims when their shell hook didn't put them there.
 pub fn path_with_tools(app_data: &Path, path: &std::ffi::OsStr) -> OsString {
     let path = &ide_core::version_managers::path_with_shims(&ide_core::version_managers::managers(), path);
-    let mut dirs = tools_bin_dirs(app_data);
+    path_with_bin_dirs(&bin_dirs_in(&tools_dir(app_data), Platform::current()), path)
+}
+
+fn path_with_bin_dirs(managed: &[PathBuf], path: &std::ffi::OsStr) -> OsString {
+    // cmd.exe drops inherited variables longer than 8191 characters. Inserting every
+    // possible tool directory can exceed that even with only one tool installed.
+    let mut dirs: Vec<_> = managed.iter().filter(|d| d.is_dir()).cloned().collect();
     let current: Vec<PathBuf> = if path.is_empty() { Vec::new() } else { std::env::split_paths(path).collect() };
-    dirs.retain(|d| !current.contains(d));
-    if dirs.is_empty() {
-        return path.to_owned();
-    }
-    dirs.extend(current);
+    dirs.extend(current.into_iter().filter(|d| !managed.contains(d)));
     std::env::join_paths(dirs).unwrap_or_else(|_| path.to_owned())
 }
 
@@ -425,8 +426,8 @@ pub struct Tools {
     root: PathBuf,
     /// Search path for system tools (excludes our own dirs).
     system_path: OsString,
-    /// `PATH` handed to installer child processes.
-    child_path: OsString,
+    /// Candidate managed directories, checked when each child process starts.
+    bin_dirs: Vec<PathBuf>,
     platform: Platform,
     /// Executables chosen in settings, by command.
     custom: BTreeMap<String, PathBuf>,
@@ -448,11 +449,10 @@ impl Tools {
         let ours = bin_dirs_in(&root, platform);
         let system: Vec<PathBuf> = std::env::split_paths(&search_path).filter(|d| !ours.contains(d)).collect();
         let system_path = std::env::join_paths(&system).unwrap_or_default();
-        let child_path = std::env::join_paths(ours.iter().chain(system.iter())).unwrap_or_default();
         Self {
             root,
             system_path,
-            child_path,
+            bin_dirs: ours,
             platform,
             custom: BTreeMap::new(),
             found: BTreeMap::new(),
@@ -502,7 +502,7 @@ impl Tools {
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut cmd = Command::new(program);
-        ide_core::process::prepare(&mut cmd).env("PATH", &self.child_path);
+        ide_core::process::prepare(&mut cmd).env("PATH", path_with_bin_dirs(&self.bin_dirs, &self.system_path));
         cmd
     }
 

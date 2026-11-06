@@ -81,6 +81,7 @@ pub async fn tools_install(
     .map_err(join_err);
     host.end_request(request);
     let info = result??;
+    host.environment.refresh_tools_path();
     // Language servers whose launch depends on installed tools (jdtls loads the
     // java-debug bundle) pick the change up.
     reconfigure_servers(host);
@@ -92,6 +93,7 @@ pub async fn tools_uninstall(host: &Host, window: &str, name: String) -> IdeResu
     let tools = tools(host, window)?;
     let langs = languages(host, window);
     let info = tokio::task::spawn_blocking(move || tools.uninstall(&name, &langs)).await.map_err(join_err)??;
+    host.environment.refresh_tools_path();
     reconfigure_servers(host);
     Ok(info)
 }
