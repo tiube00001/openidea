@@ -2145,6 +2145,8 @@ export type CodeEditingSettings = {
 	/**  Next / previous error goes to errors only (skips warnings). */
 	nextErrorErrorsOnly?: boolean,
 	stickyLinesMax?: number,
+	/**  Languages whose reference searches use the language server's own analysis scope. */
+	referenceScopeDisabledLanguages?: string[],
 };
 
 export type CodeLens = {
