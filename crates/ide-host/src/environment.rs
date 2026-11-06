@@ -111,7 +111,15 @@ impl Environment {
 
     fn publish(&self) {
         let state = self.state.lock();
-        ide_core::process::set_env_overlay(merge(&state.login, &state.project));
+        let changes = with_tool_path(&state.login, &state.project, std::env::var_os("PATH").as_deref(), &|path| {
+            ide_tools::path_with_tools(&self.data_dir, path)
+        });
+        ide_core::process::set_env_overlay(changes);
+    }
+
+    /// New children see installed and removed tools without changing this process's environment.
+    pub(crate) fn refresh_tools_path(&self) {
+        self.publish();
     }
 
     /// Reload Environment: reads the login shell again and re-applies the project's
@@ -165,6 +173,36 @@ fn merge(login: &Changes, project: &Changes) -> Changes {
     let mut out: Changes = login.iter().filter(|(k, _)| !project.iter().any(|(p, _)| p == k)).cloned().collect();
     out.extend(project.iter().cloned());
     out
+}
+
+fn with_tool_path(
+    login: &Changes,
+    project: &Changes,
+    process_path: Option<&OsStr>,
+    with_tools: &dyn Fn(&OsStr) -> OsString,
+) -> Changes {
+    let mut changes = merge(login, project);
+    let is_path = |key: &OsString| key == "PATH" || (cfg!(windows) && key.eq_ignore_ascii_case("PATH"));
+    // A project's explicit PATH, including its removal, owns executable precedence.
+    if project.iter().any(|(key, _)| is_path(key)) {
+        return changes;
+    }
+    let at = changes.iter().position(|(key, _)| is_path(key));
+    let path = match at {
+        Some(i) => match &changes[i].1 {
+            Some(path) => path.clone(),
+            None => return changes,
+        },
+        None => process_path.unwrap_or_default().to_owned(),
+    };
+    let refreshed = with_tools(&path);
+    if refreshed != path {
+        match at {
+            Some(i) => changes[i].1 = Some(refreshed),
+            None => changes.push(("PATH".into(), Some(refreshed))),
+        }
+    }
+    changes
 }
 
 /// What children need on top of this process's environment (`process`) to see the login
@@ -342,6 +380,80 @@ mod tests {
 
     fn change(k: &str, v: Option<&str>) -> (OsString, Option<OsString>) {
         (k.into(), v.map(Into::into))
+    }
+
+    #[test]
+    fn managed_path_refresh_tracks_install_and_uninstall() {
+        let installed_path = std::cell::Cell::new("system");
+        let with_tools = |path: &OsStr| {
+            assert_eq!(path, "system");
+            OsString::from(installed_path.get())
+        };
+        for current in ["system", "managed;system", "system"] {
+            installed_path.set(current);
+            let refreshed = with_tool_path(&Vec::new(), &Vec::new(), Some(OsStr::new("system")), &with_tools);
+            let expected = if current == "system" { Vec::new() } else { vec![change("PATH", Some(current))] };
+            assert_eq!(refreshed, expected);
+        }
+        let refreshed =
+            with_tool_path(&Vec::new(), &Vec::new(), Some(OsStr::new("removed;system")), &|_| "system".into());
+        assert_eq!(refreshed, [change("PATH", Some("system"))]);
+    }
+
+    #[test]
+    fn managed_path_refresh_preserves_project_paths_and_refreshes_login_paths() {
+        let login = vec![change("PATH", Some("login")), change("KEEP", Some("login-value"))];
+        let project = vec![change("PATH", Some("project")), change("PROJECT", Some("value"))];
+        let refreshed = with_tool_path(&login, &project, Some(OsStr::new("process")), &|_| {
+            panic!("an explicit project PATH must preserve its executable precedence")
+        });
+        assert_eq!(
+            refreshed,
+            [change("KEEP", Some("login-value")), change("PATH", Some("project")), change("PROJECT", Some("value"))]
+        );
+        let refreshed = with_tool_path(&login, &Vec::new(), Some(OsStr::new("process")), &|path| {
+            assert_eq!(path, "login");
+            "managed;login".into()
+        });
+        assert_eq!(refreshed, [change("PATH", Some("managed;login")), change("KEEP", Some("login-value"))]);
+    }
+
+    #[test]
+    fn managed_path_refresh_preserves_an_explicit_path_removal() {
+        let login = vec![change("PATH", Some("login"))];
+        let project = vec![change("PATH", None)];
+        let refreshed = with_tool_path(&login, &project, Some(OsStr::new("process")), &|_| {
+            panic!("an explicitly removed PATH must stay removed")
+        });
+        assert_eq!(refreshed, [change("PATH", None)]);
+    }
+
+    #[test]
+    fn a_missing_path_is_only_added_when_managed_tools_supply_one() {
+        assert!(with_tool_path(&Vec::new(), &Vec::new(), None, &|path| path.to_owned()).is_empty());
+        let refreshed = with_tool_path(&Vec::new(), &Vec::new(), None, &|_| "managed".into());
+        assert_eq!(refreshed, [change("PATH", Some("managed"))]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_path_refresh_respects_windows_environment_key_casing() {
+        let login = vec![change("PATH", Some("login"))];
+        for key in ["Path", "path", "pAtH"] {
+            for value in [Some("project"), None] {
+                let project = vec![change(key, value)];
+                let refreshed = with_tool_path(&login, &project, Some(OsStr::new("process")), &|_| {
+                    panic!("a project's Path owns executable precedence on Windows")
+                });
+                assert_eq!(refreshed, merge(&login, &project));
+            }
+            let login = vec![change(key, Some("login"))];
+            let refreshed = with_tool_path(&login, &Vec::new(), Some(OsStr::new("process")), &|path| {
+                assert_eq!(path, "login");
+                "managed;login".into()
+            });
+            assert_eq!(refreshed, [change(key, Some("managed;login"))]);
+        }
     }
 
     #[test]

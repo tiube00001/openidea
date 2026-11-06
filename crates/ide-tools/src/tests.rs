@@ -258,7 +258,77 @@ fn bin_dirs_cover_every_managed_layout() {
     assert_eq!(dirs.iter().filter(|d| **d == root.join("node_modules/.bin")).count(), 1);
     let win = bin_dirs_in(root, Platform { os: Os::Windows, arch: platform::Arch::X64 });
     assert!(win.contains(&root.join("basedpyright/venv/Scripts")));
-    assert_eq!(tools_bin_dirs(Path::new("/data"))[0], root.join("node_modules/.bin"));
+}
+
+#[test]
+fn managed_path_refreshes_existing_directories_without_dropping_user_entries() {
+    let env = Env::new();
+    let data = env.root.parent().unwrap();
+    let npm = env.root.join("node_modules/.bin");
+    let go = env.root.join("gopls/bin");
+    let user = env.sys.join("not-installed-yet");
+    let base = std::env::join_paths([&env.sys, &user]).unwrap();
+    let initial = path_with_tools(data, &base);
+    assert!(tools_bin_dirs(data).is_empty());
+    assert!(!std::env::split_paths(&initial).any(|d| d.starts_with(&env.root)));
+
+    fs::create_dir_all(&npm).unwrap();
+    fs::create_dir_all(&go).unwrap();
+    let installed = path_with_tools(data, &initial);
+    let dirs: Vec<_> = std::env::split_paths(&installed).collect();
+    assert_eq!(&dirs[..2], &[npm.clone(), go.clone()]);
+    assert!(dirs.contains(&user));
+    assert_eq!(tools_bin_dirs(data), [npm.clone(), go.clone()]);
+    assert_eq!(path_with_tools(data, &installed), installed);
+
+    fs::remove_dir(&go).unwrap();
+    let removed: Vec<_> = std::env::split_paths(&path_with_tools(data, &installed)).collect();
+    assert!(!removed.contains(&go));
+    assert!(removed.contains(&npm) && removed.contains(&user));
+}
+
+#[test]
+fn installer_commands_refresh_managed_dependencies_after_construction() {
+    let env = Env::new();
+    let tools = env.tools();
+    let path = || tools.command("unused").get_envs().find(|(k, _)| *k == "PATH").unwrap().1.unwrap().to_owned();
+    assert_eq!(path(), env.sys.as_os_str());
+    let go = env.root.join("gopls/bin");
+    fs::create_dir_all(&go).unwrap();
+    assert_eq!(std::env::split_paths(&path()).collect::<Vec<_>>(), [go.clone(), env.sys.clone()]);
+    fs::remove_dir(&go).unwrap();
+    assert_eq!(path(), env.sys.as_os_str());
+}
+
+#[cfg(windows)]
+#[test]
+fn npm_wrappers_keep_runtime_on_path_under_long_app_data_directories() {
+    let env = Env::new();
+    let data = env.root.parent().unwrap().join("long-app-data-".repeat(8));
+    let root = tools_dir(&data);
+    let npm = root.join("node_modules/.bin");
+    let runtime = env.sys.join("openidea-test-runtime.exe");
+    let cmd = std::env::var_os("COMSPEC").unwrap();
+    fs::copy(&cmd, &runtime).unwrap();
+    env.script(&npm, "test-server", "\"openidea-test-runtime\" /d /c echo runtime-ready");
+    let mut user_dirs = vec![env.sys.clone()];
+    while std::env::join_paths(&user_dirs).unwrap().len() < 4000 {
+        user_dirs.push(env.sys.join(format!("user-{}-{}", user_dirs.len(), "x".repeat(150))));
+    }
+    let base = std::env::join_paths(user_dirs).unwrap();
+    let all = std::env::join_paths(bin_dirs_in(&root, Platform::current())).unwrap();
+    let all = std::env::join_paths(std::env::split_paths(&all).chain(std::env::split_paths(&base))).unwrap();
+    assert!(all.len() > 8191, "the old PATH must exceed cmd.exe's limit: {}", all.len());
+    let tools = Tools::with_paths(root, base.clone(), Platform::current());
+    for mut command in [tools.command(npm.join("test-server.cmd")), {
+        let mut command = Command::new(npm.join("test-server.cmd"));
+        ide_core::process::prepare(&mut command).env("PATH", path_with_tools(&data, &base));
+        command
+    }] {
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "runtime-ready");
+    }
 }
 
 #[test]
